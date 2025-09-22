@@ -1,30 +1,21 @@
-// api/asaas-webhook.js
+// /api/asaas-webhook.js
 const axios = require('axios');
 const admin = require('firebase-admin');
 
-// Inicializa o Firebase Admin uma única vez
+/**
+ * Inicializa o Firebase Admin usando UMA variável com o JSON completo
+ * da conta de serviço, para evitar problemas de quebra de linha no private key.
+ */
 if (!admin.apps.length) {
-  const {
-    FIREBASE_PROJECT_ID,
-    FIREBASE_CLIENT_EMAIL,
-    FIREBASE_PRIVATE_KEY,
-  } = process.env;
-
+  const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
   admin.initializeApp({
-    credential: admin.credential.cert({
-      projectId: FIREBASE_PROJECT_ID,
-      clientEmail: FIREBASE_CLIENT_EMAIL,
-      // a chave deve estar numa linha com \n; aqui convertemos para quebras reais
-      privateKey: FIREBASE_PRIVATE_KEY
-        ? FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n')
-        : undefined,
-    }),
+    credential: admin.credential.cert(serviceAccount),
   });
 }
 
 const db = admin.firestore();
 
-// Mapeia status do Asaas -> status do Sindcontrol
+/** Mapeia status do Asaas -> status do seu app */
 const mapAsaasToApp = (asaasStatus) => {
   const map = {
     PENDING: 'Em aberto',
@@ -41,36 +32,37 @@ const mapAsaasToApp = (asaasStatus) => {
 
 module.exports = async (req, res) => {
   try {
+    // Apenas POST
     if (req.method !== 'POST') {
       return res.status(405).json({ ok: false, error: 'method_not_allowed' });
     }
 
-    // valida o token passado na URL (?token=...) ou no header
+    // Validação do token do webhook
     const token = req.query.token || req.headers['x-webhook-token'];
     if (token !== process.env.WEBHOOK_TOKEN) {
       return res.status(401).json({ ok: false, error: 'invalid_token' });
     }
 
-    // garante que temos um objeto (às vezes pode vir string)
-    const event = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : (req.body || {});
+    // Evento do Asaas
+    const event = req.body || {};
     const paymentId = event?.payment?.id;
 
-    // permite "ping" de sanidade sem payment.id
+    // Se não veio paymentId, aceite silenciosamente (sanidade)
     if (!paymentId) {
-      console.log('Webhook sem payment.id:', JSON.stringify(event));
+      console.log('Webhook recebido sem payment.id:', JSON.stringify(event));
       return res.json({ ok: true, message: 'no_payment_id' });
     }
 
-    // confirma status direto no Asaas
-    const asaasResp = await axios.get(
-      `https://api.asaas.com/v3/payments/${paymentId}`,
-      { headers: { Authorization: `Bearer ${process.env.ASAAS_API_KEY}` } }
-    );
+    // Confere status no Asaas
+    const r = await axios.get(`https://api.asaas.com/v3/payments/${paymentId}`, {
+      headers: { Authorization: `Bearer ${process.env.ASAAS_API_KEY}` },
+      timeout: 15000,
+    });
 
-    const asaasStatus = asaasResp?.data?.status || 'PENDING';
+    const asaasStatus = r.data?.status || 'PENDING';
     const statusApp = mapAsaasToApp(asaasStatus);
 
-    // localiza o doc do faturamento com esse asaasPaymentId
+    // Atualiza o doc com este asaasPaymentId
     const snap = await db
       .collection('faturamento')
       .where('asaasPaymentId', '==', paymentId)
@@ -78,20 +70,20 @@ module.exports = async (req, res) => {
       .get();
 
     if (snap.empty) {
-      console.log(`Nenhum doc faturamento com asaasPaymentId=${paymentId}`);
-      return res.json({ ok: true, message: 'no_doc_found', asaasStatus, statusApp });
+      console.log(`Nenhum documento com asaasPaymentId=${paymentId}`);
+      return res.json({ ok: true, message: 'no_doc_found' });
     }
 
-    // atualiza o documento
-    await snap.docs[0].ref.update({
+    const ref = snap.docs[0].ref;
+    await ref.update({
       status: statusApp,
       asaasRawStatus: asaasStatus,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
-    return res.json({ ok: true, asaasStatus, status: statusApp });
+    return res.json({ ok: true, status: statusApp });
   } catch (err) {
-    // <<< PATCH para mostrar o erro real >>>
+    // PATCH: loga a causa real no response e no console da Vercel
     const info = {
       message: err?.message,
       status: err?.response?.status,
